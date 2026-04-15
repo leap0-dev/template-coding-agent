@@ -5,13 +5,20 @@ import {
   DEFAULT_CODE_INTERPRETER_TEMPLATE_NAME,
   Leap0NotFoundError,
 } from 'leap0';
-import { getLeap0Client, getSandboxById, normalizeSandboxPath } from './utils';
+import {
+  getLeap0Client,
+  getSandboxAndNormalizedListPath,
+  getSandboxWithWorkdir,
+  normalizeSandboxPath,
+} from './utils';
 
-function timeoutMsToMinutes(timeoutMS: number | undefined): number | undefined {
-  if (timeoutMS === undefined) {
-    return undefined;
-  }
-  return Math.max(1, Math.ceil(timeoutMS / 60_000));
+/** Leap0 sandbox idle timeout: seconds, SDK allows 1–28800. */
+const SANDBOX_IDLE_TIMEOUT_SEC_MIN = 1;
+const SANDBOX_IDLE_TIMEOUT_SEC_MAX = 28_800;
+
+function sandboxIdleTimeoutSecondsFromMs(ms: number): number {
+  const seconds = Math.ceil(ms / 1000);
+  return Math.min(SANDBOX_IDLE_TIMEOUT_SEC_MAX, Math.max(SANDBOX_IDLE_TIMEOUT_SEC_MIN, seconds));
 }
 
 function timeoutMsToSeconds(timeoutMs: number | undefined): number | undefined {
@@ -57,8 +64,8 @@ export const createSandbox = createTool({
       Used when executing commands and code in the sandbox.
     `),
     timeoutMS: z.number().optional().describe(`
-      Timeout for the sandbox in **milliseconds** (mapped to Leap0 sandbox lifetime in minutes).
-      @default 300_000 // 5 minutes
+      Timeout for the sandbox in **milliseconds** (converted to seconds for Leap0; clamped to 1–28800s per SDK).
+      @default 300_000 // 5 minutes (300s)
     `),
   }),
   outputSchema: z
@@ -73,11 +80,11 @@ export const createSandbox = createTool({
   execute: async ({ envs, timeoutMS }) => {
     try {
       const client = getLeap0Client();
-      const timeoutMin = timeoutMsToMinutes(timeoutMS ?? 300_000);
+      const timeout = sandboxIdleTimeoutSecondsFromMs(timeoutMS ?? 300_000);
       const sandbox = await client.sandboxes.create({
         templateName: DEFAULT_CODE_INTERPRETER_TEMPLATE_NAME,
         envVars: envs,
-        timeoutMin,
+        timeout,
       });
       return { sandboxId: sandbox.id };
     } catch (e) {
@@ -128,14 +135,17 @@ export const runCode = createTool({
     ),
   execute: async ({ sandboxId, code, runCodeOpts }) => {
     try {
-      const sandbox = await getSandboxById(sandboxId);
+      const { sandbox, workspaceRoot } = await getSandboxWithWorkdir(sandboxId);
       const opts = runCodeOpts ?? {};
       const language = opts.language ?? 'python';
       const timeoutMs = opts.timeoutMS;
       const envVars = opts.envs;
 
       if (language === 'js') {
-        const tmpPath = normalizeSandboxPath(`.mastra-js-${Date.now()}-${Math.random().toString(36).slice(2, 10)}.js`);
+        const tmpPath = normalizeSandboxPath(
+          `.mastra-js-${Date.now()}-${Math.random().toString(36).slice(2, 10)}.js`,
+          workspaceRoot,
+        );
         await sandbox.filesystem.writeFile(tmpPath, code);
         try {
           const proc = await sandbox.process.execute({
@@ -203,8 +213,8 @@ export const readFile = createTool({
     ),
   execute: async ({ sandboxId, path }) => {
     try {
-      const sandbox = await getSandboxById(sandboxId);
-      const normalizedPath = normalizeSandboxPath(path);
+      const { sandbox, workspaceRoot } = await getSandboxWithWorkdir(sandboxId);
+      const normalizedPath = normalizeSandboxPath(path, workspaceRoot);
       const content = await sandbox.filesystem.readFile(normalizedPath);
       return { content, path: normalizedPath };
     } catch (e) {
@@ -233,8 +243,8 @@ export const writeFile = createTool({
     ),
   execute: async ({ sandboxId, path, content }) => {
     try {
-      const sandbox = await getSandboxById(sandboxId);
-      const normalizedPath = normalizeSandboxPath(path);
+      const { sandbox, workspaceRoot } = await getSandboxWithWorkdir(sandboxId);
+      const normalizedPath = normalizeSandboxPath(path, workspaceRoot);
       await sandbox.filesystem.writeFile(normalizedPath, content);
       return { success: true, path: normalizedPath };
     } catch (e) {
@@ -269,11 +279,11 @@ export const writeFiles = createTool({
     ),
   execute: async ({ sandboxId, files }) => {
     try {
-      const sandbox = await getSandboxById(sandboxId);
+      const { sandbox, workspaceRoot } = await getSandboxWithWorkdir(sandboxId);
       const record: Record<string, string> = {};
       const written: string[] = [];
       for (const file of files) {
-        const p = normalizeSandboxPath(file.path);
+        const p = normalizeSandboxPath(file.path, workspaceRoot);
         record[p] = file.data;
         written.push(p);
       }
@@ -290,7 +300,12 @@ export const listFiles = createTool({
   description: 'List files and directories in a path within the sandbox',
   inputSchema: z.object({
     sandboxId: z.string().describe('The sandboxId for the sandbox to list files from'),
-    path: z.string().default('/').describe('The directory path to list files from'),
+    path: z
+      .string()
+      .optional()
+      .describe(
+        'Directory to list. Omit to list the sandbox workdir (Leap0 getWorkdir, often under /home/user). Use "/" for filesystem root. Relative paths resolve from the workdir.',
+      ),
   }),
   outputSchema: z
     .object({
@@ -312,8 +327,7 @@ export const listFiles = createTool({
     ),
   execute: async ({ sandboxId, path }) => {
     try {
-      const sandbox = await getSandboxById(sandboxId);
-      const normalizedPath = normalizeSandboxPath(path ?? '/');
+      const { sandbox, normalizedPath } = await getSandboxAndNormalizedListPath(sandboxId, path);
       const listing = await sandbox.filesystem.ls(normalizedPath, { recursive: false });
       return {
         files: listing.items.map((item) => ({
@@ -348,8 +362,8 @@ export const deleteFile = createTool({
     ),
   execute: async ({ sandboxId, path }) => {
     try {
-      const sandbox = await getSandboxById(sandboxId);
-      const normalizedPath = normalizeSandboxPath(path);
+      const { sandbox, workspaceRoot } = await getSandboxWithWorkdir(sandboxId);
+      const normalizedPath = normalizeSandboxPath(path, workspaceRoot);
       const info = await sandbox.filesystem.stat(normalizedPath);
       await sandbox.filesystem.delete(normalizedPath, info.isDir);
       return { success: true, path: normalizedPath };
@@ -378,8 +392,8 @@ export const createDirectory = createTool({
     ),
   execute: async ({ sandboxId, path }) => {
     try {
-      const sandbox = await getSandboxById(sandboxId);
-      const normalizedPath = normalizeSandboxPath(path);
+      const { sandbox, workspaceRoot } = await getSandboxWithWorkdir(sandboxId);
+      const normalizedPath = normalizeSandboxPath(path, workspaceRoot);
       await sandbox.filesystem.mkdir(normalizedPath, { recursive: true });
       return { success: true, path: normalizedPath };
     } catch (e) {
@@ -414,8 +428,8 @@ export const getFileInfo = createTool({
     ),
   execute: async ({ sandboxId, path }) => {
     try {
-      const sandbox = await getSandboxById(sandboxId);
-      const normalizedPath = normalizeSandboxPath(path);
+      const { sandbox, workspaceRoot } = await getSandboxWithWorkdir(sandboxId);
+      const normalizedPath = normalizeSandboxPath(path, workspaceRoot);
       const info = await sandbox.filesystem.stat(normalizedPath);
       return {
         name: info.name,
@@ -455,8 +469,8 @@ export const checkFileExists = createTool({
   execute: async ({ sandboxId, path }) => {
     let normalizedPath = path;
     try {
-      normalizedPath = normalizeSandboxPath(path);
-      const sandbox = await getSandboxById(sandboxId);
+      const { sandbox, workspaceRoot } = await getSandboxWithWorkdir(sandboxId);
+      normalizedPath = normalizeSandboxPath(path, workspaceRoot);
       const exists = await sandbox.filesystem.exists(normalizedPath);
       if (!exists) {
         return { exists: false, path: normalizedPath };
@@ -497,8 +511,8 @@ export const getFileSize = createTool({
     ),
   execute: async ({ sandboxId, path, humanReadable }) => {
     try {
-      const sandbox = await getSandboxById(sandboxId);
-      const normalizedPath = normalizeSandboxPath(path);
+      const { sandbox, workspaceRoot } = await getSandboxWithWorkdir(sandboxId);
+      const normalizedPath = normalizeSandboxPath(path, workspaceRoot);
       const info = await sandbox.filesystem.stat(normalizedPath);
       const humanReadableSize = humanReadable ? formatBytes(info.size) : undefined;
       return {
@@ -577,10 +591,10 @@ export const runCommand = createTool({
     ),
   execute: async ({ sandboxId, command, envs, workingDirectory, timeoutMs, captureOutput }) => {
     try {
-      const sandbox = await getSandboxById(sandboxId);
+      const { sandbox, workspaceRoot } = await getSandboxWithWorkdir(sandboxId);
       const startTime = Date.now();
       const timeoutSeconds = timeoutMsToSeconds(timeoutMs ?? 30000);
-      const cwd = workingDirectory ? normalizeSandboxPath(workingDirectory) : undefined;
+      const cwd = workingDirectory ? normalizeSandboxPath(workingDirectory, workspaceRoot) : undefined;
       const result = await sandbox.process.execute({
         command,
         cwd,
