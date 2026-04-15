@@ -67,6 +67,21 @@ export const createSandbox = createTool({
       Timeout for the sandbox in **milliseconds** (converted to seconds for Leap0; clamped to 1–28800s per SDK).
       @default 300_000 // 5 minutes (300s)
     `),
+    memoryMiB: z
+      .number()
+      .int()
+      .min(512)
+      .max(8192)
+      .refine((n) => n % 2 === 0, { message: 'memoryMiB must be even (Leap0 requirement)' })
+      .optional()
+      .describe('Sandbox memory in **MiB** (Leap0: even integer 512–8192). Omit for SDK default (1024).'),
+    vcpu: z
+      .number()
+      .int()
+      .min(1)
+      .max(8)
+      .optional()
+      .describe('Sandbox vCPUs (Leap0: 1–8). Omit for SDK default (1).'),
   }),
   outputSchema: z
     .object({
@@ -77,7 +92,7 @@ export const createSandbox = createTool({
         error: z.string(),
       }),
     ),
-  execute: async ({ envs, timeoutMS }) => {
+  execute: async ({ envs, timeoutMS, memoryMiB, vcpu }) => {
     try {
       const client = getLeap0Client();
       const timeout = sandboxIdleTimeoutSecondsFromMs(timeoutMS ?? 300_000);
@@ -85,6 +100,8 @@ export const createSandbox = createTool({
         templateName: DEFAULT_CODE_INTERPRETER_TEMPLATE_NAME,
         envVars: envs,
         timeout,
+        ...(memoryMiB !== undefined ? { memory: memoryMiB } : {}),
+        ...(vcpu !== undefined ? { vcpu } : {}),
       });
       return { sandboxId: sandbox.id };
     } catch (e) {
@@ -162,7 +179,7 @@ export const runCode = createTool({
             }),
           };
         } finally {
-          await sandbox.filesystem.delete(tmpPath, false).catch(() => {});
+          await sandbox.filesystem.delete({ path: tmpPath, recursive: false }).catch(() => {});
         }
       }
 
@@ -365,7 +382,7 @@ export const deleteFile = createTool({
       const { sandbox, workspaceRoot } = await getSandboxWithWorkdir(sandboxId);
       const normalizedPath = normalizeSandboxPath(path, workspaceRoot);
       const info = await sandbox.filesystem.stat(normalizedPath);
-      await sandbox.filesystem.delete(normalizedPath, info.isDir);
+      await sandbox.filesystem.delete({ path: normalizedPath, recursive: info.isDir });
       return { success: true, path: normalizedPath };
     } catch (e) {
       return toError(e);
